@@ -297,6 +297,24 @@ class AutoSpyreModelForCausalLM(AutoSpyreModel):
 
         model.generate = MethodType(model_generate, model)  # type: ignore[assignment]
 
+        if hasattr(module, "_run_forward_naive"):
+
+            def model_generate_naive(
+                self: PreTrainedModel,
+                tokenizer: Any,
+                prompts: list[str],
+                **kwargs: Any,
+            ):
+                from hf_adapters.hf_common import generate_naive
+
+                return generate_naive(
+                    module._run_forward_naive, self, tokenizer, prompts, **kwargs
+                )
+
+            model.generate_naive = MethodType(  # type: ignore[assignment]
+                model_generate_naive, model
+            )
+
         return model
 
 

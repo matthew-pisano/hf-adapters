@@ -1546,6 +1546,181 @@ def generate(
     return decode_block_walk(result, num_generated, padded_len, eos_ids, tokenizer)
 
 
+def generate_naive(
+    run_forward_naive_fn: Callable,
+    model,
+    tokenizer,
+    prompts,
+    max_new_tokens,
+    do_sample=None,
+    temperature=None,
+    top_k=None,
+    top_p=None,
+    eos_token_id=_UNSET,
+    timing=False,
+):
+    """Cache-free generation loop with static tensor shapes.
+
+    Avoids all KV-cache machinery — no ``is_filling`` / ``token_index`` /
+    ``cache_position`` Python-scalar specialization.  Instead the full
+    input sequence (prompt + generated tokens so far) is re-attended each
+    step, with the context window pre-allocated to
+    ``padded_prompt_len + max_new_tokens`` so that tensor shapes never
+    change across decode steps and ``torch.compile(dynamic=False)`` only
+    ever needs a **single** compiled binary for the entire run.
+
+    ``run_forward_naive_fn`` must have the signature::
+
+        fn(model, input_ids, position_ids, attn_mask) -> logits
+            # input_ids:   [B, total_len]  int64
+            # position_ids: [B, total_len] int64
+            # attn_mask:   [B, 1, total_len, total_len]  float (additive)
+            # logits:      [B, total_len, vocab_size]
+
+    The attention mask encodes both causal masking and which positions are
+    currently "live" (real prompt or already-generated tokens vs still-empty
+    future slots), so the compiled model never sees a varying shape or any
+    Python-scalar token-count argument.
+
+    All sampling / EOS parameters follow the same precedence as ``generate``.
+    """
+    overrides = {
+        "do_sample": do_sample,
+        "temperature": temperature,
+        "top_k": top_k,
+        "top_p": top_p,
+    }
+    if eos_token_id is not _UNSET:
+        overrides["eos_token_id"] = eos_token_id
+    params = _resolve_generation_params(model, tokenizer, overrides)
+    do_sample = params["do_sample"]
+    temperature = params["temperature"]
+    top_k = params["top_k"]
+    top_p = params["top_p"]
+    eos_ids = params["eos_ids"]
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    encoded = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        padding_side="left",
+        return_attention_mask=True,
+    )
+    input_ids = encoded["input_ids"]
+    attention_mask = encoded["attention_mask"]
+    batch_size = input_ids.shape[0]
+    prompt_length = input_ids.shape[1]
+
+    # Actual (non-padded) prompt lengths per sequence.
+    actual_prompt_lengths = attention_mask.sum(dim=1)  # [B]
+
+    # Block-pad the prompt to a BLOCK_SIZE multiple (left-pad with zeros).
+    padded_prompt_len = math.ceil(prompt_length / BLOCK_SIZE) * BLOCK_SIZE
+    block_pad = padded_prompt_len - prompt_length
+    if block_pad > 0:
+        pad = input_ids.new_zeros((batch_size, block_pad))
+        input_ids = torch.cat([pad, input_ids], dim=1)
+
+    # Pre-allocate the full buffer once: [B, total_len].
+    # Positions beyond padded_prompt_len are initially zero (pad token).
+    total_len = padded_prompt_len + max_new_tokens
+    full_ids = torch.zeros((batch_size, total_len), dtype=torch.long)
+    full_ids[:, :padded_prompt_len] = input_ids
+
+    # Position IDs: left-pad slots get 0, real tokens get 0..actual_len-1.
+    prompt_offsets = padded_prompt_len - actual_prompt_lengths  # [B]
+    full_pos = torch.zeros((batch_size, total_len), dtype=torch.long)
+    for b in range(batch_size):
+        n = actual_prompt_lengths[b].item()
+        start = prompt_offsets[b].item()
+        # Prompt positions
+        full_pos[b, start:padded_prompt_len] = torch.arange(n, dtype=torch.long)
+        # Decode positions will be filled in the loop below
+
+    # Additive causal attention mask: [B, 1, total_len, total_len].
+    # Initialized to all -inf (nothing attends to anything yet).
+    model_dtype = get_model_dtype(model)
+    attn_mask = torch.full(
+        (batch_size, 1, total_len, total_len), -torch.inf, dtype=model_dtype
+    )
+
+    # Unmask the prompt portion: each query position i can attend to all
+    # real prompt positions <= i (causal), ignoring left-padding columns.
+    for b in range(batch_size):
+        off = prompt_offsets[b].item()
+        for i in range(padded_prompt_len):
+            # Row i attends to columns [off .. i] (causal, skip left-pad).
+            attn_mask[b, 0, i, off : i + 1] = 0.0
+
+    times_list = []
+    finished = torch.zeros(batch_size, dtype=torch.bool)
+    num_generated = torch.zeros(batch_size, dtype=torch.long)
+
+    for step in range(max_new_tokens):
+        t0 = time.time()
+
+        # For decode steps, set position IDs and unmask the slot for the
+        # token that was written at the end of the previous step.
+        if step > 0:
+            tok_slot = padded_prompt_len + step - 1
+            for b in range(batch_size):
+                full_pos[b, tok_slot] = actual_prompt_lengths[b].item() + step - 1
+                off = prompt_offsets[b].item()
+                attn_mask[b, 0, tok_slot, off : tok_slot + 1] = 0.0
+
+        # Current query is the last prompt token (step 0) or the token just
+        # unmasked above (step > 0); logits[:, query_idx, :] gives next token.
+        query_idx = padded_prompt_len - 1 if step == 0 else padded_prompt_len + step - 1
+
+        logits = run_forward_naive_fn(
+            model,
+            full_ids.to(DEVICE),
+            full_pos.to(DEVICE),
+            attn_mask.to(DEVICE),
+        )
+        next_logits = logits.to("cpu")[:, query_idx, :]
+
+        if timing:
+            times_list.append(time.time() - t0)
+
+        next_tokens = select_next_token(
+            next_logits, do_sample, temperature, top_k, top_p
+        )
+
+        # Write the generated token into the buffer at the next free slot.
+        write_idx = padded_prompt_len + step
+        full_ids[:, write_idx] = next_tokens
+
+        if eos_ids is not None:
+            finished |= torch.isin(next_tokens, eos_ids)
+        num_generated += (~finished).long()
+
+        if finished.all():
+            break
+
+    # Timing report
+    if timing and times_list:
+        print(f"\nFirst-token latency: {times_list[0]*1000:.3f} ms")
+        if len(times_list) > 1:
+            avg = sum(times_list[1:]) / len(times_list[1:])
+            print(f"Avg next-token latency: {avg*1000:.3f} ms")
+        print("Per-token: " + ", ".join(f"{t*1000:.1f}" for t in times_list) + " ms")
+
+    # Decode: collect generated token IDs from full_ids[b, padded_prompt_len:]
+    results = []
+    for b in range(batch_size):
+        n = num_generated[b].item()
+        gen_ids = full_ids[b, padded_prompt_len : padded_prompt_len + n]
+        if eos_ids is not None:
+            eos_pos = torch.isin(gen_ids, eos_ids).nonzero(as_tuple=True)[0]
+            if len(eos_pos) > 0:
+                gen_ids = gen_ids[: eos_pos[0].item()]
+        results.append(tokenizer.decode(gen_ids, skip_special_tokens=True))
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Standard GQA adapter helpers
 # ---------------------------------------------------------------------------
@@ -1683,6 +1858,111 @@ def prepare_standard_gqa_blocks(layers, is_res_mul: bool | None = None):
         layers[i] = block
         blocks.append(torch.compile(block, dynamic=False))
     return blocks
+
+
+# ---------------------------------------------------------------------------
+# Naive (cache-free) GQA adapter helpers  — used by generate_naive
+# ---------------------------------------------------------------------------
+
+
+class NaiveGQAAttention(nn.Module):
+    """Cache-free attention for the naive generation path.
+
+    Accepts the full-sequence ``hidden_states`` and a pre-built additive
+    causal mask.  No KV-cache tensors, no ``is_filling`` / ``token_index`` /
+    ``cache_position`` Python scalars — so ``torch.compile(dynamic=False)``
+    never respecializes between decode steps.
+    """
+
+    def __init__(self, attn):
+        super().__init__()
+        self.q_proj = attn.q_proj
+        self.k_proj = attn.k_proj
+        self.v_proj = attn.v_proj
+        self.o_proj = attn.o_proj
+        self.head_dim = attn.head_dim
+        self.v_head_dim = getattr(attn, "v_head_dim", attn.head_dim)
+        self.scaling = attn.scaling
+
+    def forward(self, hidden_states, selected_freqs, attn_mask):
+        bsz, seq_len, _ = hidden_states.shape
+        q = (
+            self.q_proj(hidden_states)
+            .view(bsz, seq_len, -1, self.head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            self.k_proj(hidden_states)
+            .view(bsz, seq_len, -1, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.v_proj(hidden_states)
+            .view(bsz, seq_len, -1, self.v_head_dim)
+            .transpose(1, 2)
+        )
+
+        q = apply_rope_matmul(q, selected_freqs)
+        k = apply_rope_matmul(k, selected_freqs)
+
+        attn_out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            scale=self.scaling,
+            enable_gqa=True,
+        )
+        attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
+        return self.o_proj(attn_out)
+
+
+class NaiveGQABlock(nn.Module):
+    """Cache-free decoder block for the naive generation path."""
+
+    def __init__(self, layer, is_res_mul: bool | None = None):
+        super().__init__()
+        self.self_attn = NaiveGQAAttention(layer.self_attn)
+        self.mlp = layer.mlp
+        self.input_layernorm = layer.input_layernorm
+        self.post_attention_layernorm = layer.post_attention_layernorm
+        self.residual_multiplier = layer.residual_multiplier if is_res_mul else None
+        self.train(layer.training)
+
+    def forward(self, hidden_states, selected_freqs, attn_mask):
+        residual = hidden_states
+        h = self.input_layernorm(hidden_states)
+        attn_out = self.self_attn(h, selected_freqs, attn_mask)
+
+        if self.residual_multiplier is None:
+            h = residual + attn_out
+        else:
+            h = residual + attn_out * self.residual_multiplier
+
+        residual = h
+        h = self.post_attention_layernorm(h)
+        h = self.mlp(h)
+        if self.residual_multiplier is None:
+            h = residual + h
+        else:
+            h = residual + h * self.residual_multiplier
+
+        return h
+
+
+def prepare_naive_gqa_blocks(layers, is_res_mul: bool | None = None):
+    """Build compiled cache-free blocks for the naive generation path.
+
+    Unlike ``prepare_standard_gqa_blocks`` these blocks do **not** replace
+    the entries in ``layers`` — the standard cached blocks are left in place
+    so that ``model.generate`` still works alongside ``model.generate_naive``.
+    Returns a list of compiled ``NaiveGQABlock`` instances.
+    """
+    return [
+        torch.compile(NaiveGQABlock(layer, is_res_mul), dynamic=False)
+        for layer in layers
+    ]
 
 
 def make_decoder_block(

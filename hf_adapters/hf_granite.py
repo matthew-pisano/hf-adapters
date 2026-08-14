@@ -30,6 +30,7 @@ from hf_adapters.hf_common import (
     get_backbone,
     pad_lm_head,
     patch_rmsnorm,
+    prepare_naive_gqa_blocks,
     prepare_rope_and_heads,
     prepare_standard_gqa_blocks,
     text_config,
@@ -97,6 +98,32 @@ def _run_forward(
     return logits / text_config(model.config).logits_scaling
 
 
+def _run_forward_naive(
+    model,
+    input_ids,
+    position_ids,
+    attn_mask,
+):
+    """Granite 3.3 cache-free causal-LM forward for generate_naive.
+
+    Re-attends the full sequence each step.  No KV cache, no Python-scalar
+    ``is_filling`` / ``token_index`` / ``cache_position`` arguments — the
+    only inputs are tensors whose shapes stay constant for the whole run.
+    """
+    backbone = get_backbone(model)
+    h = backbone.embed_tokens(input_ids)
+    h = h * backbone.embedding_multiplier
+
+    selected_freqs = model._spyre_rope(h, position_ids)
+
+    for compiled_block in model._spyre_naive_compiled_blocks:
+        h = compiled_block(h, selected_freqs, attn_mask)
+
+    h = backbone.norm(h)
+    logits = model.lm_head(h)
+    return logits / text_config(model.config).logits_scaling
+
+
 def prepare_for_spyre(model):
     """Apply Spyre adaptations to Granite 3.3 model in-place."""
     from transformers.models.granite.modeling_granite import GraniteRMSNorm
@@ -105,5 +132,11 @@ def prepare_for_spyre(model):
     patch_rmsnorm(GraniteRMSNorm)
     pad_lm_head(model)
     model._spyre_compiled_blocks = prepare_standard_gqa_blocks(
+        get_backbone(model).layers, True
+    )
+    # Naive (cache-free) blocks share weights with the standard blocks but
+    # have no cache arguments; compiled separately so generate_naive gets its
+    # own static binary that never recompiles across decode steps.
+    model._spyre_naive_compiled_blocks = prepare_naive_gqa_blocks(
         get_backbone(model).layers, True
     )
